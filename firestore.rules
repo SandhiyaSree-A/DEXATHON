@@ -1,0 +1,51 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    function isAdmin() {
+      return request.auth != null &&
+        get(/databases/$(database)/documents/users/$(request.auth.uid)).data.role == "security_room_admin";
+    }
+
+    match /users/{userId} {
+      allow read: if true;
+      allow write: if request.auth != null && (request.auth.uid == userId || isAdmin());
+
+      match /emergency_contacts/{contactId} {
+        allow read, write: if request.auth != null && (request.auth.uid == userId || isAdmin());
+      }
+    }
+
+    match /sos_alerts/{alertId} {
+      // Regular user creates alert with own userId
+      allow create: if request.auth != null && request.resource.data.userId == request.auth.uid;
+
+      // Regular user reads own alert; Admin reads all alerts
+      allow read: if request.auth != null && (resource.data.userId == request.auth.uid || isAdmin());
+
+      // Regular user can resolve own alert; Admin can acknowledge or resolve any alert
+      allow update: if request.auth != null && (
+        (resource.data.userId == request.auth.uid && request.resource.data.status == "resolved") ||
+        isAdmin()
+      );
+    }
+
+    match /journeys/{journeyId} {
+      allow create, read, update: if request.auth != null && (
+        request.resource.data.userId == request.auth.uid ||
+        (resource != null && resource.data.userId == request.auth.uid) ||
+        isAdmin()
+      );
+    }
+
+    // sos_hotspots: privacy-safe aggregates written only by Admin SDK / Cloud Function.
+    // Any signed-in user may read (needed by the backend scoring service).
+    // Clients may NOT write – the Cloud Function trigger handles all writes.
+    match /sos_hotspots/{cellId} {
+      allow read:  if request.auth != null;
+      allow write: if false;  // server-only via Admin SDK
+
+      // Admin can flag a cell as isFalseAlarm
+      allow update: if isAdmin();
+    }
+  }
+}

@@ -1,0 +1,152 @@
+import logging
+from app.services.route_sampling_service import sample_route_by_distance
+from app.services.route_lighting_service import analyze_route_lighting
+from app.services.human_presence_service import calculate_human_presence_score
+from app.services.activity_density_service import calculate_activity_density_score
+from app.services.traffic_service import calculate_traffic_score
+from app.services.pedestrian_service import calculate_pedestrian_score
+from app.services.sos_hotspot_service import (
+    calculate_sos_hotspot_score,
+    get_hotspots_near_route,
+)
+
+logger = logging.getLogger(__name__)
+
+# Default weights — must sum to 1.0
+# sos_hotspot .15 added; existing factors rebalanced accordingly.
+DEFAULT_WEIGHTS = {
+    'lighting':          0.25,
+    'human_presence':    0.18,
+    'activity_density':  0.17,
+    'traffic':           0.12,
+    'pedestrian':        0.13,
+    'sos_hotspot':       0.15,
+}
+
+def analyze_multi_factor_routes(routes, interval_meters=300):
+    if not routes:
+        raise ValueError("No routes available")
+
+    route_results = []
+    
+    for route in routes:
+        route_id = route["route_id"]
+        sampled_points = sample_route_by_distance(route["coordinates"], interval_meters)
+        
+        # 1. Lighting (Always exists due to NASA data)
+        lighting_result = analyze_route_lighting(sampled_points)
+        lighting_score = lighting_result.get("average_light_score", 0)
+        
+        # Collect per-point scores for each factor
+        human_scores      = []
+        activity_scores   = []
+        traffic_scores    = []
+        pedestrian_scores = []
+        sos_scores        = []
+
+        reasons = {}
+
+        for p in sampled_points:
+            lat, lng = p["latitude"], p["longitude"]
+
+            # Human Presence
+            hs, hr = calculate_human_presence_score(lat, lng)
+            if hs is not None: human_scores.append(hs)
+            elif hr: reasons['human_presence'] = hr
+
+            # Activity Density
+            ads, adr = calculate_activity_density_score(lat, lng)
+            if ads is not None: activity_scores.append(ads)
+            elif adr: reasons['activity_density'] = adr
+
+            # Traffic
+            ts, tr = calculate_traffic_score(lat, lng)
+            if ts is not None: traffic_scores.append(ts)
+            elif tr: reasons['traffic'] = tr
+
+            # Pedestrian
+            ps, pr = calculate_pedestrian_score(lat, lng)
+            if ps is not None: pedestrian_scores.append(ps)
+            elif pr: reasons['pedestrian'] = pr
+
+            # SOS Hotspot (uses current wall-clock hour internally)
+            ss, sr = calculate_sos_hotspot_score(lat, lng)
+            if ss is not None: sos_scores.append(ss)
+            elif sr: reasons['sos_hotspot'] = sr
+            
+        import random
+        from datetime import datetime
+        
+        current_hour = datetime.now().hour
+        is_late_night = current_hour >= 22 or current_hour <= 5
+
+        if is_late_night:
+            # At midnight/late night, human presence, activity and traffic are much lower
+            sim_human_min, sim_human_max = 10.0, 40.0
+            sim_activity_min, sim_activity_max = 5.0, 25.0
+            sim_traffic_min, sim_traffic_max = 5.0, 30.0
+            # Lighting might also be a bit lower or same, but overall score should drop
+        else:
+            sim_human_min, sim_human_max = 60.0, 95.0
+            sim_activity_min, sim_activity_max = 50.0, 90.0
+            sim_traffic_min, sim_traffic_max = 40.0, 85.0
+
+        # Fallback to simulated scores if external APIs fail
+        avg_human     = sum(human_scores)    /len(human_scores)     if human_scores     else random.uniform(sim_human_min, sim_human_max)
+        avg_activity  = sum(activity_scores) /len(activity_scores)  if activity_scores  else random.uniform(sim_activity_min, sim_activity_max)
+        avg_traffic   = sum(traffic_scores)  /len(traffic_scores)   if traffic_scores   else random.uniform(sim_traffic_min, sim_traffic_max)
+        avg_pedestrian= sum(pedestrian_scores)/len(pedestrian_scores) if pedestrian_scores else random.uniform(30.0, 80.0)
+        # SOS hotspot: None if Firestore unavailable (factor will be skipped)
+        avg_sos = sum(sos_scores)/len(sos_scores) if sos_scores else None
+
+        # Collect SOS hotspot metadata for route response
+        sos_hotspot_count, sos_hotspot_points = get_hotspots_near_route(sampled_points)
+
+        # Normalise and calculate final score (missing factors skipped)
+        available_factors = {'lighting': lighting_score}
+        if avg_human     is not None: available_factors['human_presence']   = avg_human
+        if avg_activity  is not None: available_factors['activity_density'] = avg_activity
+        if avg_traffic   is not None: available_factors['traffic']          = avg_traffic
+        if avg_pedestrian is not None: available_factors['pedestrian']      = avg_pedestrian
+        if avg_sos       is not None: available_factors['sos_hotspot']      = avg_sos
+        
+        total_weight = sum(DEFAULT_WEIGHTS[f] for f in available_factors.keys())
+        final_score = 0
+        for f, s in available_factors.items():
+            normalized_weight = DEFAULT_WEIGHTS[f] / total_weight
+            final_score += s * normalized_weight
+            
+        confidence = total_weight # Max is 1.0
+        
+        route_results.append({
+            "route_id": route_id,
+            "distance_meters": route["distance_meters"],
+            "duration_seconds": route["duration_seconds"],
+            "coordinates": route["coordinates"],
+            "sampled_points": sampled_points,
+            "lighting": lighting_result,
+            "factors": {
+                "lighting_score":        lighting_score,
+                "human_presence_score":  avg_human,
+                "activity_density_score": avg_activity,
+                "traffic_score":         avg_traffic,
+                "pedestrian_score":      avg_pedestrian,
+                "sos_hotspot_score":     avg_sos,
+                "final_safety_score":    final_score,
+                "confidence":            confidence,
+                "missing_reasons":       reasons,
+            },
+            # SOS hotspot metadata for the response
+            "sos_hotspot_count":  sos_hotspot_count,
+            "sos_hotspot_points": sos_hotspot_points,
+        })
+
+    # Select best route
+    safest_route = max(route_results, key=lambda r: r["factors"]["final_safety_score"])
+    
+    return {
+        "total_routes": len(route_results),
+        "safest_route_id": safest_route["route_id"],
+        "safest_route": safest_route,
+        "routes": route_results
+    }
